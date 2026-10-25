@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 rand = "0.10.3"
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 rustls = "0.23.46"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }

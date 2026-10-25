@@ -1,11 +1,12 @@
 use chrono::{Duration, Utc};
 use rand::RngExt;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
@@ -26,6 +27,9 @@ struct AppConfig {
     max_garbage_bytes: usize,
     #[serde(default = "default_chunk_size")]
     chunk_size: usize,
+    // 新增：友军暗号，默认为空（空则不启用暗号）
+    #[serde(default = "default_auth_token")]
+    auth_token: String,
 }
 
 fn default_bind_addr() -> String {
@@ -46,6 +50,9 @@ fn default_max_garbage() -> usize {
 fn default_chunk_size() -> usize {
     8192
 }
+fn default_auth_token() -> String {
+    "my_secret_antimtm_token".to_string()
+}
 
 impl AppConfig {
     fn load_or_create() -> Self {
@@ -63,6 +70,7 @@ impl AppConfig {
             min_garbage_bytes: default_min_garbage(),
             max_garbage_bytes: default_max_garbage(),
             chunk_size: default_chunk_size(),
+            auth_token: default_auth_token(),
         };
         if let Ok(toml_str) = toml::to_string_pretty(&default_cfg) {
             let _ = fs::write(config_path, toml_str);
@@ -72,7 +80,41 @@ impl AppConfig {
     }
 }
 
-// ==================== 2. 高仿数据生成器 ====================
+// ==================== 2. 数据库初始化与记录 ====================
+fn init_db() -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open("mitm_intel.db")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS probe_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            probe_time TEXT NOT NULL,
+            is_authorized INTEGER NOT NULL,
+            action_taken TEXT
+        )",
+        [],
+    )?;
+    Ok(conn)
+}
+
+fn log_to_db(ip: String, port: u16, is_auth: bool, action: &str) {
+    let time_str = Utc::now().to_rfc3339();
+    let auth_val = if is_auth { 1 } else { 0 };
+    let action_str = action.to_string();
+
+    // 扔进阻塞线程池，绝不卡住 Tokio 的高并发主线程
+    tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = Connection::open("mitm_intel.db") {
+            let _ = conn.execute(
+                "INSERT INTO probe_logs (ip, port, probe_time, is_authorized, action_taken)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![ip, port, time_str, auth_val, action_str],
+            );
+        }
+    });
+}
+
+// ==================== 3. 高仿数据生成器 ====================
 fn generate_fake_web_data(size: usize, is_first_chunk: bool) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
 
@@ -103,7 +145,7 @@ fn generate_fake_web_data(size: usize, is_first_chunk: bool) -> Vec<u8> {
     data
 }
 
-// ==================== 3. 主函数 ====================
+// ==================== 4. 主函数 ====================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load_or_create();
@@ -115,6 +157,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new(&config.key_path).exists() {
         eprintln!("[!] 找不到私钥文件: {}", config.key_path);
         return Ok(());
+    }
+
+    // 初始化本地 SQLite 情报库
+    if let Err(e) = init_db() {
+        eprintln!("[!] 数据库初始化失败: {}", e);
+    } else {
+        println!("[+] SQLite 威胁情报库 mitm_intel.db 已就绪");
     }
 
     rustls::crypto::aws_lc_rs::default_provider()
@@ -134,11 +183,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_single_cert(cert_chain, key)?;
 
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     println!("[+] 终极折磨版诱饵服务端已启动，监听: {}", config.bind_addr);
+    println!("[+] 友军暗号路径前缀: /_probe_{}", config.auth_token);
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -151,89 +200,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match acceptor.accept(stream).await {
                 Ok(mut tls_stream) => {
-                    println!(
-                        "\n🚨 [捕获探测节点] IP: {} (端口: {})",
-                        client_ip, client_port
-                    );
+                    // 1. 读取前 1024 个字节，校验暗号
+                    let mut buf = [0; 1024];
+                    let mut is_authorized = false;
 
-                    // 在独立作用域内生成 header 相关随机数，避免 RNG 跨 await 存活
-                    let (total_size, header) = {
-                        let mut rng = rand::rng();
-                        let size = rng.random_range(cfg.min_garbage_bytes..=cfg.max_garbage_bytes);
-                        let offset = Duration::seconds(rng.random_range(-3..=3));
-                        let now = Utc::now() + offset;
-                        let http_date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                    // 设置 2 秒超时，防止 Slowloris 攻击卡住服务端
+                    let read_timeout = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tls_stream.read(&mut buf),
+                    )
+                    .await;
 
-                        let session_id = format!("{:x}", rng.random_range(10000000..99999999));
-                        let etag = format!("W/\"{:x}\"", rng.random_range(10000000..99999999));
+                    if let Ok(Ok(n)) = read_timeout {
+                        if n > 0 {
+                            let req_str = String::from_utf8_lossy(&buf[..n]);
+                            // 如果请求路径中包含了约定的暗号
+                            if req_str.contains(&format!("/_probe_{}", cfg.auth_token)) {
+                                is_authorized = true;
+                            }
+                        }
+                    }
 
-                        let header = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Server: nginx/1.24.0 (Ubuntu)\r\n\
-                             Date: {}\r\n\
-                             Content-Type: text/html; charset=utf-8\r\n\
-                             Transfer-Encoding: chunked\r\n\
-                             Set-Cookie: session={}; Path=/; HttpOnly\r\n\
-                             ETag: {}\r\n\
-                             X-Cache: HIT from Cloudflare\r\n\
-                             X-Content-Type-Options: nosniff\r\n\r\n",
-                            http_date, session_id, etag
+                    // 2. 根据暗号验证结果分流
+                    if is_authorized {
+                        // 【友军放行】
+                        println!(
+                            "\n[✓] 验证通过！{} (端口: {}) 是友军探针。",
+                            client_ip, client_port
+                        );
+                        let _ = tls_stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await;
+                        let _ = tls_stream.shutdown().await;
+
+                        // 记录到 SQLite（标记为友军放行）
+                        let ip_str = client_ip.to_string();
+                        log_to_db(ip_str, client_port, true, "Authorized: Peaceful Pass");
+                    } else {
+                        // 【敌军重拳】
+                        println!(
+                            "\n🚨 [捕获探测节点] IP: {} (端口: {}) - 无暗号，开始投喂诱饵...",
+                            client_ip, client_port
                         );
 
-                        (size, header)
-                    };
-
-                    if tls_stream.write_all(header.as_bytes()).await.is_err() {
-                        return;
-                    }
-
-                    let mut sent = 0;
-                    let mut is_first = true;
-
-                    while sent < total_size {
-                        let current_chunk = {
+                        let (total_size, header) = {
                             let mut rng = rand::rng();
-                            std::cmp::min(
-                                cfg.chunk_size + rng.random_range(0..2048),
-                                total_size - sent,
-                            )
+                            let size =
+                                rng.random_range(cfg.min_garbage_bytes..=cfg.max_garbage_bytes);
+                            let offset = Duration::seconds(rng.random_range(-3..=3));
+                            let now = Utc::now() + offset;
+                            let http_date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                            let session_id = format!("{:x}", rng.random_range(10000000..99999999));
+                            let etag = format!("W/\"{:x}\"", rng.random_range(10000000..99999999));
+
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\n\
+                                 Server: nginx/1.24.0 (Ubuntu)\r\n\
+                                 Date: {}\r\n\
+                                 Content-Type: text/html; charset=utf-8\r\n\
+                                 Transfer-Encoding: chunked\r\n\
+                                 Set-Cookie: session={}; Path=/; HttpOnly\r\n\
+                                 ETag: {}\r\n\
+                                 X-Cache: HIT from Cloudflare\r\n\
+                                 X-Content-Type-Options: nosniff\r\n\r\n",
+                                http_date, session_id, etag
+                            );
+                            (size, header)
                         };
 
-                        let garbage = generate_fake_web_data(current_chunk, is_first);
-                        is_first = false;
-
-                        // 使用 HTTP chunked 格式包裹数据，骗过 DPI
-                        let chunk_header = format!("{:x}\r\n", current_chunk);
-                        if tls_stream.write_all(chunk_header.as_bytes()).await.is_err() {
-                            return;
-                        }
-                        if tls_stream.write_all(&garbage).await.is_err() {
-                            return;
-                        }
-                        if tls_stream.write_all(b"\r\n").await.is_err() {
+                        if tls_stream.write_all(header.as_bytes()).await.is_err() {
                             return;
                         }
 
-                        sent += current_chunk;
+                        let mut sent = 0;
+                        let mut is_first = true;
 
-                        // 动态延时：模拟真实的网络抖动
-                        let sleep_ms = {
-                            let mut rng = rand::rng();
-                            if rng.random_bool(0.05) {
-                                rng.random_range(200..500)
-                            } else if rng.random_bool(0.2) {
-                                rng.random_range(20..100)
-                            } else {
-                                rng.random_range(1..5)
+                        while sent < total_size {
+                            let current_chunk = {
+                                let mut rng = rand::rng();
+                                std::cmp::min(
+                                    cfg.chunk_size + rng.random_range(0..2048),
+                                    total_size - sent,
+                                )
+                            };
+
+                            let garbage = generate_fake_web_data(current_chunk, is_first);
+                            is_first = false;
+
+                            let chunk_header = format!("{:x}\r\n", current_chunk);
+                            if tls_stream.write_all(chunk_header.as_bytes()).await.is_err() {
+                                return;
                             }
-                        };
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    }
+                            if tls_stream.write_all(&garbage).await.is_err() {
+                                return;
+                            }
+                            if tls_stream.write_all(b"\r\n").await.is_err() {
+                                return;
+                            }
 
-                    // 结束 chunked 传输
-                    let _ = tls_stream.write_all(b"0\r\n\r\n").await;
-                    println!("[+] 向节点 {} 投喂完毕，共发送 {} 字节。", client_ip, sent);
-                    let _ = tls_stream.shutdown().await;
+                            sent += current_chunk;
+
+                            let sleep_ms = {
+                                let mut rng = rand::rng();
+                                if rng.random_bool(0.05) {
+                                    rng.random_range(200..500)
+                                } else if rng.random_bool(0.2) {
+                                    rng.random_range(20..100)
+                                } else {
+                                    rng.random_range(1..5)
+                                }
+                            };
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+
+                        let _ = tls_stream.write_all(b"0\r\n\r\n").await;
+                        let _ = tls_stream.shutdown().await;
+
+                        println!("[+] 向节点 {} 投喂完毕，共发送 {} 字节。", client_ip, sent);
+
+                        // 记录到 SQLite（标记为敌军投毒）
+                        let ip_str = client_ip.to_string();
+                        let action_msg = format!("Poisoned with {} bytes", sent);
+                        log_to_db(ip_str, client_port, false, &action_msg);
+                    }
                 }
                 Err(_) => {}
             }
