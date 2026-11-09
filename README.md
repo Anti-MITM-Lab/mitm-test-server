@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main
 
 ```bash
 # 安装指定版本
-... | sudo bash -s -- --version 0.8.3
+... | sudo bash -s -- --version 0.9.0
 
 # 指定监听地址与暗号
 ... | sudo bash -s -- --bind 0.0.0.0:8443 --token "$(openssl rand -hex 32)"
@@ -80,7 +80,7 @@ journalctl -u mitm-test-server -f
 
 # 友军放行（应返回 authorized JSON）
 curl -k -H "X-Probe-Token: <安装脚本打印的暗号>" https://127.0.0.1:8443/
-# {"status":"authorized","probe":"mitm-test-server","version":"0.8.3"}
+# {"status":"authorized","probe":"mitm-test-server","version":"0.9.0"}
 ```
 
 ## 从源码构建
@@ -113,6 +113,9 @@ cargo build --release --target aarch64-unknown-linux-musl
 | `handshake_timeout_secs` / `header_timeout_secs` | 10 / 8 | 握手与读头超时，防 Slowloris |
 | `max_connections` | `512` | 并发上限，超出直接丢弃 |
 | `max_conn_per_ip` | `32` | 单 IP 并发上限，`0` 为不限制 |
+| `gzip_bomb_ratio` | `0` | gzip 炸弹出现概率（0~100，`0` 关闭） |
+| `gzip_bomb_mib` | `256` | gzip 炸弹解压后的目标大小（MiB） |
+| `keep_alive_max_requests` | `1` | 单连接最多处理几个请求（`1` 不复用） |
 | `abuseipdb_api_key` | 空 | 留空则关闭自动举报 |
 | `report_cooldown_secs` | `3600` | 同一 IP 举报冷却时间 |
 
@@ -126,7 +129,7 @@ curl -k -H "Authorization: Bearer $TOKEN" https://host:8443/
 curl -k "https://host:8443/?token=$TOKEN"
 ```
 
-未授权的请求会走投毒流程，响应形态在五种模式中按权重随机：
+未授权的请求会走投毒流程，响应形态按权重随机：
 
 | 模式 | 行为 |
 |------|------|
@@ -135,9 +138,33 @@ curl -k "https://host:8443/?token=$TOKEN"
 | `endless` | 分块流**不发送终止块**，客户端只能干等或超时 |
 | `redirect` | `302` 指向随机路径，诱导爬虫无限跟随 |
 | `error` | `500` 错误页 + 巨型注释填充 |
+| `gzip` | **默认关闭**：传输仅几十 KB，解压后 `gzip_bomb_mib` MiB，把 CPU/内存开销转给对方 |
+
+> 关于 gzip 炸弹：开启后（`gzip_bomb_ratio > 0`）同一份压缩流在启动时生成一次、所有连接共享。
+> 它不只消耗扫描器，也会连带打爆中间代理与企业解码器，请自行评估影响范围后再开。
+> 炸弹生成在启动时完成（约几十毫秒到数秒，取决于 `gzip_bomb_mib`），期间不监听端口。
 
 同时会随机化 `Server`、`Date`（±3 秒偏移）、`ETag`、Cookie 与 CDN 头，并在分块之间
 插入抖动与偶发长停顿（tarpit），让对方在"超时"和"重试"之间反复消耗。
+
+## 运维
+
+```bash
+# 只校验配置/证书/数据库，不绑定端口（改完配置先跑这个最省事）
+cd /etc/mitm-test && mitm-test-server --check
+
+# 版本 / 帮助
+mitm-test-server --version
+mitm-test-server --help
+
+# 热加载配置（systemd 里已配置 ExecReload，等价于 kill -HUP <pid>）
+systemctl reload mitm-test-server
+```
+
+热加载覆盖：暗号、投毒规模/节奏、单 IP 配额、举报配置、gzip 炸弹、keep-alive 请求数。
+`bind_addr`、`cert_path`、`key_path`、`db_path`、`max_connections` 依赖监听 socket /
+证书 / 数据库句柄，改动后需要 `systemctl restart`，热加载时日志会明确指出哪些字段没生效。
+**配置写错时热加载会拒绝并继续用旧配置**，不会把正在跑的服务弄挂。
 
 ## 情报库
 

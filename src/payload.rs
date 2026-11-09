@@ -15,6 +15,9 @@
 
 use std::time::Duration;
 
+use std::io::Write;
+use std::sync::Arc;
+
 use rand::RngExt;
 
 use crate::config::AppConfig;
@@ -27,6 +30,8 @@ pub enum Kind {
     Endless,
     Redirect,
     Error,
+    /// gzip 炸弹：传输体积很小，解压后极大。
+    Gzip,
 }
 
 impl Kind {
@@ -38,12 +43,19 @@ impl Kind {
             Kind::Endless => "endless",
             Kind::Redirect => "redirect",
             Kind::Error => "error",
+            Kind::Gzip => "gzip-bomb",
         }
     }
 
     /// 按权重抽签：大头仍是"大页面"，少量极端模式增加不可预测性。
-    fn pick() -> Self {
-        match rand::rng().random_range(0..100u32) {
+    ///
+    /// `gzip_bomb_ratio` 是 gzip 炸弹的百分比概率，`0` 表示不参与抽签。
+    fn pick(config: &AppConfig) -> Self {
+        let roll = rand::rng().random_range(0..100u32);
+        if config.gzip_bomb_ratio > 0 && roll < config.gzip_bomb_ratio {
+            return Kind::Gzip;
+        }
+        match roll {
             0..=49 => Kind::Html,
             50..=71 => Kind::Binary,
             72..=83 => Kind::Endless,
@@ -51,6 +63,39 @@ impl Kind {
             _ => Kind::Error,
         }
     }
+}
+
+/// 预生成的 gzip 炸弹。
+///
+/// 压缩后的字节量很小（几万到几十万字节），解压后达到 [`GzipBomb::mib`] MiB，
+/// 因此可以在启动/热加载时生成一次，之后所有连接共享同一份。
+pub struct GzipBomb {
+    /// 完整的 gzip 流，可直接按分块写给客户端。
+    pub data: Arc<Vec<u8>>,
+    /// 解压后的目标大小（MiB），用于日志与热加载时判断是否需要重建。
+    pub mib: u64,
+}
+
+/// 生成 gzip 炸弹：把重复的 HTML 片段压缩成很小的 gzip 流。
+///
+/// 使用纯 Rust 后端（flate2 的 `rust_backend`），避免 musl 静态构建依赖系统 zlib。
+pub fn build_gzip_bomb(mib: u64) -> std::io::Result<GzipBomb> {
+    let target_bytes = mib.saturating_mul(1024 * 1024);
+    // 约 48 KiB 的高重复片段，压缩比最好。
+    let block = "<div class=\"cell\"><span>loading</span></div>\n".repeat(1024);
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    let mut written: u64 = 0;
+    while written < target_bytes {
+        encoder.write_all(block.as_bytes())?;
+        written += block.len() as u64;
+    }
+    let data = encoder.finish()?;
+
+    Ok(GzipBomb {
+        data: Arc::new(data),
+        mib,
+    })
 }
 
 /// 一次投毒的完整计划。
@@ -62,19 +107,26 @@ pub struct Plan {
     pub body_bytes: usize,
     /// 是否发送分块终止符（`Endless` 模式故意不发）。
     pub terminate: bool,
+    /// gzip 炸弹的预压缩正文；仅 `Kind::Gzip` 时有值。
+    pub precompressed: Option<Arc<Vec<u8>>>,
 }
 
 /// 生成一次投毒计划。
-pub fn plan(config: &AppConfig) -> Plan {
+///
+/// `bomb` 为 `None` 时不会选择 gzip 模式（例如刚热加载、炸弹还没生成完）。
+pub fn plan(config: &AppConfig, bomb: Option<&GzipBomb>) -> Plan {
     let mut rng = rand::rng();
-    let kind = Kind::pick();
+    let mut kind = Kind::pick(config);
+    if kind == Kind::Gzip && bomb.is_none() {
+        kind = Kind::Html;
+    }
     let persona = Persona::pick();
 
-    // 只有 302 的正文为 0，其余都按配置规模投毒。
-    let body_bytes = if kind == Kind::Redirect {
-        0
-    } else {
-        rng.random_range(config.min_garbage_bytes..=config.max_garbage_bytes)
+    // 只有 302 的正文为 0；gzip 模式正文长度就是压缩流长度。
+    let body_bytes = match kind {
+        Kind::Redirect => 0,
+        Kind::Gzip => bomb.map(|bomb| bomb.data.len()).unwrap_or(0),
+        _ => rng.random_range(config.min_garbage_bytes..=config.max_garbage_bytes),
     };
 
     // Date 随机偏移几秒：让依赖时间缓存的中间件（代理、CDN）行为异常。
@@ -126,6 +178,10 @@ pub fn plan(config: &AppConfig) -> Plan {
     }
 
     push_header(&mut head, "Connection", "keep-alive");
+    if kind == Kind::Gzip {
+        // 声明 gzip：客户端/代理会自动解压，把 CPU 与内存开销转给对方。
+        push_header(&mut head, "Content-Encoding", "gzip");
+    }
     push_header(
         &mut head,
         "Cache-Control",
@@ -166,6 +222,10 @@ pub fn plan(config: &AppConfig) -> Plan {
         head,
         body_bytes,
         terminate: kind != Kind::Endless,
+        precompressed: match kind {
+            Kind::Gzip => bomb.map(|bomb| Arc::clone(&bomb.data)),
+            _ => None,
+        },
     }
 }
 
@@ -178,7 +238,8 @@ pub fn chunk(kind: Kind, len: usize, first: bool) -> Vec<u8> {
         Kind::Binary => noise(len),
         Kind::Redirect => redirect_body(len),
         Kind::Error => text_body(len, first, Kind::Error),
-        Kind::Html | Kind::Endless => text_body(len, first, kind),
+        // gzip 模式由服务端从预压缩数据切片发送，不走这里。
+        Kind::Gzip | Kind::Html | Kind::Endless => text_body(len, first, kind),
     }
 }
 
@@ -348,3 +409,36 @@ const TEMPLATES: &[&str] = &[
     "/* {\"id\":{n},\"hash\":\"{hex}\",\"state\":\"active\",\"ts\":{n}000} */\n",
     "<script type=\"application/json\" id=\"cfg-{n}\">{{\"id\":{n},\"nonce\":\"{hex}\",\"flags\":[{n},1,0]}}</script>\n",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// gzip 炸弹必须能被正常解压回目标大小，而且压缩后足够小。
+    #[test]
+    fn gzip_bomb_expands_back_to_target() {
+        let bomb = build_gzip_bomb(2).expect("应能生成炸弹");
+        assert_eq!(&bomb.data[..2], &[0x1f, 0x8b], "应是 gzip 魔数");
+        assert!(
+            bomb.data.len() < 128 * 1024,
+            "压缩后应远小于 2 MiB，实际 {} 字节",
+            bomb.data.len()
+        );
+
+        let mut decoder = flate2::read::GzDecoder::new(&bomb.data[..]);
+        let mut total: u64 = 0;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = decoder.read(&mut buffer).expect("解压不应失败");
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+        }
+        assert!(
+            total >= 2 * 1024 * 1024,
+            "解压后至少 2 MiB，实际 {total} 字节"
+        );
+    }
+}

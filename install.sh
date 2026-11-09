@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
-#   sudo bash install.sh --version 0.8.4 --bind 0.0.0.0:8443
+#   sudo bash install.sh --version 0.9.0 --bind 0.0.0.0:8443
 #   sudo bash install.sh --auto-port            # 端口被占用时自动顺延
 #   sudo bash install.sh --uninstall            # 卸载（保留配置与数据）
 #   sudo bash install.sh --uninstall --purge    # 彻底删除
@@ -77,7 +77,7 @@ mitm-test-server 安装脚本
   sudo bash install.sh [选项]
 
 基本选项：
-  --version <ver>    安装指定版本（如 0.8.1 或 v0.8.1），默认 latest
+  --version <ver>    安装指定版本（如 0.9.0 或 v0.9.0），默认 latest
   --bind <addr>      监听地址，默认 0.0.0.0:8443
   --port <port>      只改端口，保留 --bind 的主机部分
   --auto-port        端口被占用时自动顺延到下一个空闲端口
@@ -203,7 +203,7 @@ detect_target() {
     esac
 }
 
-# 解析要安装的 release tag（形如 v0.8.1）。
+# 解析要安装的 release tag（形如 v0.9.0）。
 resolve_tag() {
     if [ "$VERSION" = "latest" ]; then
         log "查询最新版本……" >&2
@@ -635,6 +635,13 @@ max_garbage_bytes = 8000000
 chunk_size = 8192
 poison_deadline_secs = 600
 
+# gzip 炸弹：按百分比概率发送"小体积、大解压"的响应（0 = 关闭）
+gzip_bomb_ratio = 0
+gzip_bomb_mib = 256
+
+# 单连接最多处理几个请求（1 = 不复用连接）
+keep_alive_max_requests = 1
+
 # 连接与超时保护
 max_connections = 512
 max_conn_per_ip = 32
@@ -717,6 +724,7 @@ User=${SVC_USER}
 Group=${SVC_USER}
 WorkingDirectory=${CONFIG_DIR}
 ExecStart=${PREFIX}/bin/${BIN_NAME}
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=65535

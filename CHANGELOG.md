@@ -10,6 +10,29 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-09
+
+### 新增
+
+- **gzip 炸弹**（默认关闭）：`gzip_bomb_ratio` 控制出现概率（0~100），
+  `gzip_bomb_mib` 控制解压后大小（默认 256 MiB）。压缩流在启动时生成一次，
+  所有连接共享；实测 8 MiB 炸弹压缩后约 24 KiB。响应带 `Content-Encoding: gzip`，
+  解压开销全部转移给探测方（也会连带影响中间代理，开启前请评估）。
+- **keep-alive 复用**：`keep_alive_max_requests`（默认 1 不复用）。大于 1 时，
+  同一条连接会被反复投毒，直到达到请求数或对端关闭。
+- **`--check`**：只校验配置、证书/私钥、数据库路径后退出，不绑定端口；
+  适合改完配置先自检，或在 systemd 里配合 `ExecStartPre` 使用。
+- **`--version` / `--help`**：命令行查询版本与用法。
+- **SIGHUP 热加载**：`systemctl reload mitm-test-server`（等价 `kill -HUP`）重新读取
+  配置，暗号、投毒参数、单 IP 配额、举报配置、gzip、keep-alive 立即生效；
+  监听地址/证书/数据库/全局并发数变更会提示需要重启。配置写错时保留旧配置继续服务。
+- systemd 单元增加 `ExecReload`；启动横幅展示 gzip、keep-alive 与热加载提示。
+
+### 修复
+
+- 修复投毒结束即 `shutdown` TLS 连接的问题：keep-alive 复用下第二请求无法读取。
+  现在由调用方在真正结束时关闭连接。
+
 ## [0.8.4] - 2026-11-09
 
 ### 新增

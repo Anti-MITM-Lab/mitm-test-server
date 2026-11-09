@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -21,7 +21,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::config::AppConfig;
 use crate::db::{Database, ProbeEvent};
 use crate::http::{self, HeadError, MAX_HEAD_BYTES, RequestHead};
-use crate::payload::{self, Plan};
+use crate::payload::{self, GzipBomb, Plan};
 use crate::report::Reporter;
 
 /// 单次写入的超时：对方若长时间不读，说明连接已死或在做流控，直接放弃。
@@ -32,28 +32,34 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 全局 `Semaphore` 只能防止总量失控；单个 IP 仍可以占满全部槽位、吃光出口带宽。
 /// 这里按来源 IP 再限一层，超出直接丢弃连接（连 TLS 握手都不做）。
 struct IpLimiter {
-    limit: usize,
+    limit: AtomicUsize,
     active: std::sync::Mutex<HashMap<IpAddr, usize>>,
 }
 
 impl IpLimiter {
     fn new(limit: usize) -> Self {
         Self {
-            limit,
+            limit: AtomicUsize::new(limit),
             active: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
+    /// SIGHUP 热加载时调整配额；已在连的连接不受影响，新连接立即生效。
+    fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
     /// 申请一个名额；超过上限返回 `None`。
     fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpGuard> {
+        let limit = self.limit.load(Ordering::Relaxed);
         let mut active = match self.active.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if self.limit > 0 {
+        if limit > 0 {
             let count = active.entry(ip).or_insert(0);
-            if *count >= self.limit {
+            if *count >= limit {
                 return None;
             }
             *count += 1;
@@ -62,7 +68,7 @@ impl IpLimiter {
         Some(IpGuard {
             limiter: Arc::clone(self),
             ip,
-            counted: self.limit > 0,
+            counted: limit > 0,
         })
     }
 }
@@ -97,20 +103,85 @@ impl Drop for IpGuard {
     }
 }
 
+/// 运行期可热替换的共享状态（SIGHUP 时更新）。
+struct SharedState {
+    config: RwLock<Arc<AppConfig>>,
+    bomb: RwLock<Option<Arc<GzipBomb>>>,
+}
+
+impl SharedState {
+    fn new(config: Arc<AppConfig>, bomb: Option<Arc<GzipBomb>>) -> Self {
+        Self {
+            config: RwLock::new(config),
+            bomb: RwLock::new(bomb),
+        }
+    }
+
+    fn config(&self) -> Arc<AppConfig> {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_config(&self, config: AppConfig) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(config);
+    }
+
+    fn bomb(&self) -> Option<Arc<GzipBomb>> {
+        self.bomb
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_bomb(&self, bomb: Option<Arc<GzipBomb>>) {
+        *self
+            .bomb
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = bomb;
+    }
+}
+
 /// 启动服务，直到收到 Ctrl-C / SIGTERM。
 pub async fn run(
     config: Arc<AppConfig>,
     db: Database,
-    reporter: Reporter,
+    mut reporter: Reporter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let acceptor = load_tls_acceptor(&config)?;
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let local_address = listener.local_addr()?;
-    print_banner(&config, local_address, &reporter);
+
+    let mut bomb = None;
+    if config.gzip_bomb_ratio > 0 {
+        info!(
+            "正在生成 gzip 炸弹（解压后约 {} MiB）……",
+            config.gzip_bomb_mib
+        );
+        match build_bomb(config.gzip_bomb_mib).await {
+            Some(built) => {
+                info!("gzip 炸弹就绪：压缩后 {} KiB", built.data.len() / 1024);
+                bomb = Some(Arc::new(built));
+            }
+            None => warn!("gzip 炸弹生成失败，本次运行不会使用该模式"),
+        }
+    }
+
+    let state = Arc::new(SharedState::new(Arc::clone(&config), bomb));
+    print_banner(&state, &config, local_address, &reporter);
 
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let per_ip = Arc::new(IpLimiter::new(config.max_conn_per_ip));
     let active = Arc::new(AtomicU64::new(0));
+
+    // SIGHUP → 配置热加载（信号处理任务常驻，避免信号在无处理者时终止进程）。
+    let (reload_tx, mut reload_rx) = mpsc::channel::<()>(4);
+    spawn_reload_listener(reload_tx);
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -119,6 +190,10 @@ pub async fn run(
             _ = &mut shutdown => {
                 info!("收到退出信号，停止接收新连接……");
                 break;
+            }
+            // 收到 None 表示信号任务已退出，该分支自动失效（不会空转）。
+            Some(()) = reload_rx.recv() => {
+                reload_config(&state, &per_ip, &mut reporter).await;
             }
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
@@ -153,14 +228,14 @@ pub async fn run(
                 };
 
                 let acceptor = acceptor.clone();
-                let config = Arc::clone(&config);
+                let state = Arc::clone(&state);
                 let db = db.clone();
                 let reporter = reporter.clone();
                 let active = Arc::clone(&active);
 
                 tokio::spawn(async move {
                     active.fetch_add(1, Ordering::Relaxed);
-                    handle_connection(stream, peer, &acceptor, &config, &db, &reporter).await;
+                    handle_connection(stream, peer, &acceptor, &state, &db, &reporter).await;
                     active.fetch_sub(1, Ordering::Relaxed);
                     drop(ip_guard);
                     drop(permit);
@@ -180,20 +255,124 @@ pub async fn run(
     Ok(())
 }
 
+/// 在阻塞线程池里生成 gzip 炸弹，避免卡住 reactor。
+async fn build_bomb(mib: u64) -> Option<GzipBomb> {
+    match tokio::task::spawn_blocking(move || payload::build_gzip_bomb(mib)).await {
+        Ok(Ok(bomb)) => Some(bomb),
+        Ok(Err(e)) => {
+            warn!("生成 gzip 炸弹失败: {e}");
+            None
+        }
+        Err(e) => {
+            warn!("生成 gzip 炸弹的任务失败: {e}");
+            None
+        }
+    }
+}
+
+/// 注册 SIGHUP 监听，转为 channel 消息。
+fn spawn_reload_listener(tx: mpsc::Sender<()>) {
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+                warn!("注册 SIGHUP 失败，热加载不可用");
+                return;
+            };
+            while hangup.recv().await.is_some() {
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 没有 SIGHUP：持有 sender 让接收端永远 pending。
+        tokio::spawn(async move {
+            let _keep = tx;
+            std::future::pending::<()>().await;
+        });
+    }
+}
+
+/// 重新读取配置并应用可热加载的部分；失败时保持旧配置继续服务。
+async fn reload_config(
+    state: &Arc<SharedState>,
+    limiter: &Arc<IpLimiter>,
+    reporter: &mut Reporter,
+) {
+    let new_config = match AppConfig::load_existing() {
+        Ok(config) => config,
+        Err(e) => {
+            error!("配置重载失败，继续使用旧配置: {e}");
+            return;
+        }
+    };
+    let old = state.config();
+
+    // 这些字段依赖监听 socket / 证书 / 数据库句柄，只能重启生效。
+    for (name, changed) in [
+        ("bind_addr", old.bind_addr != new_config.bind_addr),
+        ("cert_path", old.cert_path != new_config.cert_path),
+        ("key_path", old.key_path != new_config.key_path),
+        ("db_path", old.db_path != new_config.db_path),
+        (
+            "max_connections",
+            old.max_connections != new_config.max_connections,
+        ),
+    ] {
+        if changed {
+            warn!("{name} 已变更，需要重启服务才能生效");
+        }
+    }
+
+    let token_changed = old.auth_token != new_config.auth_token;
+    let gzip_mib = new_config.gzip_bomb_mib;
+    let gzip_enabled = new_config.gzip_bomb_ratio > 0;
+
+    limiter.set_limit(new_config.max_conn_per_ip);
+    *reporter = Reporter::new(
+        new_config.abuseipdb_api_key.clone(),
+        Duration::from_secs(new_config.report_cooldown_secs),
+    );
+    state.set_config(new_config);
+
+    if gzip_enabled {
+        let needs_rebuild = state
+            .bomb()
+            .map(|bomb| bomb.mib != gzip_mib)
+            .unwrap_or(true);
+        if needs_rebuild {
+            info!("重新生成 gzip 炸弹（解压后约 {gzip_mib} MiB）……");
+            state.set_bomb(build_bomb(gzip_mib).await.map(Arc::new));
+        }
+    } else {
+        state.set_bomb(None);
+    }
+
+    info!(
+        "配置已热加载（暗号{}更新）",
+        if token_changed { "已" } else { "未" }
+    );
+}
+
 /// 单条连接的完整生命周期。
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     acceptor: &TlsAcceptor,
-    config: &AppConfig,
+    state: &Arc<SharedState>,
     db: &Database,
     reporter: &Reporter,
 ) {
     // 关闭 Nagle：小分块也能立刻发出，节奏更接近真实服务器。
     let _ = stream.set_nodelay(true);
 
+    let boot_config = state.config();
     let mut tls = match tokio::time::timeout(
-        Duration::from_secs(config.handshake_timeout_secs),
+        Duration::from_secs(boot_config.handshake_timeout_secs),
         acceptor.accept(stream),
     )
     .await
@@ -210,100 +389,120 @@ async fn handle_connection(
         }
     };
 
-    // 解析失败同样投毒：不少扫描器会先发一段非 HTTP 数据探活，或者干脆
-    // 发超长/畸形请求头；以前直接关连接等于白送它一次探测机会。
-    let head = match http::read_head(
-        &mut tls,
-        Duration::from_secs(config.header_timeout_secs),
-        MAX_HEAD_BYTES,
-    )
-    .await
-    {
-        Ok(head) => Some(head),
-        Err(e @ HeadError::Eof) => {
-            debug!("{peer} 未发送请求就断开: {e}");
+    // keep-alive：同一连接最多处理 `keep_alive_max_requests` 个请求（默认 1）。
+    let mut served: usize = 0;
+    loop {
+        let config = state.config();
+        let first_request = served == 0;
+
+        // 解析失败同样投毒：不少扫描器会先发一段非 HTTP 数据探活，或者干脆
+        // 发超长/畸形请求头；以前直接关连接等于白送它一次探测机会。
+        let head = match http::read_head(
+            &mut tls,
+            Duration::from_secs(config.header_timeout_secs),
+            MAX_HEAD_BYTES,
+        )
+        .await
+        {
+            Ok(head) => Some(head),
+            Err(e @ HeadError::Eof) => {
+                debug!("{peer} 未发送请求就断开: {e}");
+                return;
+            }
+            Err(e) => {
+                if !first_request {
+                    debug!("{peer} 后续请求读取失败（{e}），结束连接");
+                    return;
+                }
+                debug!("{peer} 请求头无效（{e}），转为直接投毒");
+                None
+            }
+        };
+
+        if let Some(head) = &head
+            && head.is_http2_preface()
+        {
+            debug!("{peer} 直接发送了 HTTP/2 前言（未走 ALPN），按未授权处理");
+        }
+
+        let user_agent = head
+            .as_ref()
+            .and_then(|head| head.user_agent())
+            .map(str::to_string);
+        let ua_display = user_agent.clone().unwrap_or_else(|| "-".to_string());
+        // 落库/上报/日志统一用脱敏后的目标，避免把 `?token=` 里的暗号写进磁盘或第三方。
+        let target = head.as_ref().map(|head| http::redact_target(&head.target));
+        let target_display = target.clone().unwrap_or_else(|| "-".to_string());
+        let method = head
+            .as_ref()
+            .map(|head| head.method.as_str())
+            .unwrap_or("-");
+
+        if head
+            .as_ref()
+            .is_some_and(|head| is_authorized(head, &config.auth_token))
+        {
+            success!("验证通过：{peer} 是友军探针（UA: {ua_display}）");
+            let response = authorized_response();
+            let _ = tls.write_all(response.as_bytes()).await;
+            let _ = tls.shutdown().await;
+            db.record(ProbeEvent {
+                ip: peer.ip().to_string(),
+                port: peer.port(),
+                authorized: true,
+                action: "Authorized: peaceful pass".to_string(),
+                user_agent,
+                target,
+                payload_kind: Some("none".to_string()),
+                bytes_sent: response.len() as u64,
+            });
             return;
         }
-        Err(e) => {
-            debug!("{peer} 请求头无效（{e}），转为直接投毒");
-            None
+
+        if head.is_none() {
+            warn!("捕获未完成 HTTP 请求的探测节点 {peer}（UA: {ua_display}），直接投毒");
+        } else {
+            warn!(
+                "捕获未授权探测节点 {peer}（{method} {target_display}，UA: {ua_display}），开始投毒"
+            );
         }
-    };
 
-    if let Some(head) = &head
-        && head.is_http2_preface()
-    {
-        debug!("{peer} 直接发送了 HTTP/2 前言（未走 ALPN），按未授权处理");
-    }
+        if reporter.enabled() {
+            reporter.report_later(
+                peer.ip(),
+                format!("{peer} {method} {target_display} UA={ua_display}"),
+            );
+        }
 
-    let user_agent = head
-        .as_ref()
-        .and_then(|head| head.user_agent())
-        .map(str::to_string);
-    let ua_display = user_agent.clone().unwrap_or_else(|| "-".to_string());
-    // 落库/上报/日志统一用脱敏后的目标，避免把 `?token=` 里的暗号写进磁盘或第三方。
-    let target = head.as_ref().map(|head| http::redact_target(&head.target));
-    let target_display = target.clone().unwrap_or_else(|| "-".to_string());
-    let method = head
-        .as_ref()
-        .map(|head| head.method.as_str())
-        .unwrap_or("-");
+        let plan = payload::plan(&config, state.bomb().as_deref());
+        let started = Instant::now();
+        let (sent, reason) = poison(&mut tls, &plan, &config).await;
+        let elapsed = started.elapsed().as_secs_f64();
 
-    if head
-        .as_ref()
-        .is_some_and(|head| is_authorized(head, &config.auth_token))
-    {
-        success!("验证通过：{peer} 是友军探针（UA: {ua_display}）");
-        let response = authorized_response();
-        let _ = tls.write_all(response.as_bytes()).await;
-        let _ = tls.shutdown().await;
+        info!(
+            "投毒结束 {peer} → 已发送 {}（模式 {}，耗时 {elapsed:.1}s，结束原因 {reason}）",
+            human_bytes(sent),
+            plan.kind.label()
+        );
+
         db.record(ProbeEvent {
             ip: peer.ip().to_string(),
             port: peer.port(),
-            authorized: true,
-            action: "Authorized: peaceful pass".to_string(),
+            authorized: false,
+            action: format!("Poisoned with {sent} bytes ({reason})"),
             user_agent,
             target,
-            payload_kind: Some("none".to_string()),
-            bytes_sent: response.len() as u64,
+            payload_kind: Some(plan.kind.label().to_string()),
+            bytes_sent: sent,
         });
-        return;
+
+        served += 1;
+        // 无限流模式没有终止块，连接无法复用；其余模式可继续读下一个请求。
+        if !plan.terminate || served >= config.keep_alive_max_requests {
+            let _ = tls.shutdown().await;
+            return;
+        }
     }
-
-    if head.is_none() {
-        warn!("捕获未完成 HTTP 请求的探测节点 {peer}（UA: {ua_display}），直接投毒");
-    } else {
-        warn!("捕获未授权探测节点 {peer}（{method} {target_display}，UA: {ua_display}），开始投毒");
-    }
-
-    if reporter.enabled() {
-        reporter.report_later(
-            peer.ip(),
-            format!("{peer} {method} {target_display} UA={ua_display}"),
-        );
-    }
-
-    let plan = payload::plan(config);
-    let started = Instant::now();
-    let (sent, reason) = poison(&mut tls, &plan, config).await;
-    let elapsed = started.elapsed().as_secs_f64();
-
-    info!(
-        "投毒结束 {peer} → 已发送 {}（模式 {}，耗时 {elapsed:.1}s，结束原因 {reason}）",
-        human_bytes(sent),
-        plan.kind.label()
-    );
-
-    db.record(ProbeEvent {
-        ip: peer.ip().to_string(),
-        port: peer.port(),
-        authorized: false,
-        action: format!("Poisoned with {sent} bytes ({reason})"),
-        user_agent,
-        target,
-        payload_kind: Some(plan.kind.label().to_string()),
-        bytes_sent: sent,
-    });
 }
 
 /// 向未授权连接持续投喂垃圾数据，返回（已发送字节数，结束原因）。
@@ -343,7 +542,15 @@ where
             break;
         }
 
-        let body = payload::chunk(plan.kind, length, first_chunk);
+        // gzip 炸弹直接切片发送预压缩数据；其余模式现场生成。
+        let body: Vec<u8> = match &plan.precompressed {
+            Some(data) => {
+                let start = sent as usize;
+                let end = (start + length).min(data.len());
+                data[start..end].to_vec()
+            }
+            None => payload::chunk(plan.kind, length, first_chunk),
+        };
         first_chunk = false;
 
         // 一个分块 = 十六进制长度行 + 正文 + CRLF，三段落任一失败即视为断连。
@@ -365,7 +572,7 @@ where
     if plan.terminate {
         let _ = write_all_timeout(stream, b"0\r\n\r\n").await;
     }
-    let _ = stream.shutdown().await;
+    // 注意：这里不能 shutdown——启用 keep-alive 时调用方还要复用这条连接。
     (sent, reason)
 }
 
@@ -427,7 +634,11 @@ fn authorized_response() -> String {
 }
 
 /// 加载证书与私钥，构建 TLS acceptor。
-fn load_tls_acceptor(config: &AppConfig) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+///
+/// 同时供 `--check` 自检使用，因此对 crate 内可见。
+pub(crate) fn load_tls_acceptor(
+    config: &AppConfig,
+) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
     for path in [&config.cert_path, &config.key_path] {
         if !std::path::Path::new(path).exists() {
             return Err(format!(
@@ -459,7 +670,7 @@ fn load_tls_acceptor(config: &AppConfig) -> Result<TlsAcceptor, Box<dyn std::err
 }
 
 /// 启动横幅（不打印暗号本身，避免日志泄露口令）。
-fn print_banner(config: &AppConfig, local: SocketAddr, reporter: &Reporter) {
+fn print_banner(state: &SharedState, config: &AppConfig, local: SocketAddr, reporter: &Reporter) {
     info!(
         "mitm-test-server v{} 已启动，TLS 监听 {local}",
         env!("CARGO_PKG_VERSION")
@@ -478,6 +689,23 @@ fn print_banner(config: &AppConfig, local: SocketAddr, reporter: &Reporter) {
             config.max_conn_per_ip.to_string()
         }
     );
+    if config.gzip_bomb_ratio > 0 {
+        let ready = if state.bomb().is_some() {
+            "已就绪"
+        } else {
+            "未就绪"
+        };
+        info!(
+            "gzip 炸弹：{}%（解压后约 {} MiB，{}）",
+            config.gzip_bomb_ratio, config.gzip_bomb_mib, ready
+        );
+    } else {
+        info!("gzip 炸弹：已关闭（gzip_bomb_ratio = 0）");
+    }
+    info!(
+        "单连接请求数上限：{}（1 表示不复用 keep-alive）",
+        config.keep_alive_max_requests
+    );
     if reporter.enabled() {
         info!(
             "AbuseIPDB 自动举报：已启用（同 IP 冷却 {} 秒）",
@@ -486,6 +714,7 @@ fn print_banner(config: &AppConfig, local: SocketAddr, reporter: &Reporter) {
     } else {
         info!("AbuseIPDB 自动举报：未配置 API Key，已关闭");
     }
+    info!("热加载：kill -HUP <pid> 重新读取配置（监听地址/证书/数据库需重启）");
 }
 
 /// 字节数转人类可读形式。

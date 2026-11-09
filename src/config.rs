@@ -44,6 +44,14 @@ pub struct AppConfig {
     pub handshake_timeout_secs: u64,
     /// 单次投毒的最长持续时间（秒），`0` 表示不限制。
     pub poison_deadline_secs: u64,
+    /// gzip 炸弹模式的出现概率（百分比，0~100）。`0` 表示关闭。
+    ///
+    /// 开启后按该概率发送"压缩很小、解压极大"的响应，把解压开销转移给探测方。
+    pub gzip_bomb_ratio: u32,
+    /// gzip 炸弹解压后的目标大小（MiB）。
+    pub gzip_bomb_mib: u64,
+    /// 单条连接最多处理几个请求（1 表示不复用连接）。
+    pub keep_alive_max_requests: usize,
     /// 并发连接上限，超出后直接丢弃新连接以保护文件描述符。
     pub max_connections: usize,
     /// 单个来源 IP 的并发连接上限，`0` 表示不限制。
@@ -70,6 +78,9 @@ impl Default for AppConfig {
             header_timeout_secs: 8,
             handshake_timeout_secs: 10,
             poison_deadline_secs: 600,
+            gzip_bomb_ratio: 0,
+            gzip_bomb_mib: 256,
+            keep_alive_max_requests: 1,
             max_connections: 512,
             max_conn_per_ip: 32,
             report_cooldown_secs: 3600,
@@ -94,6 +105,17 @@ impl AppConfig {
             }
             Err(e) => Err(format!("无法读取配置文件 {CONFIG_FILE}: {e}")),
         }
+    }
+
+    /// 只读取已存在的配置，不生成模板。
+    ///
+    /// 供 `--check` 与 SIGHUP 热加载使用：配置缺失时应当报错，而不是悄悄写一份默认值。
+    pub fn load_existing() -> Result<Self, String> {
+        let text = std::fs::read_to_string(CONFIG_FILE)
+            .map_err(|e| format!("无法读取配置文件 {CONFIG_FILE}: {e}"))?;
+        let config: AppConfig =
+            toml::from_str(&text).map_err(|e| format!("配置文件 {CONFIG_FILE} 解析失败: {e}"))?;
+        config.validate()
     }
 
     /// 校验并就地修正不合理取值，避免运行期出现除零、空块等怪异行为。
@@ -124,6 +146,15 @@ impl AppConfig {
         if self.handshake_timeout_secs == 0 {
             return Err("handshake_timeout_secs 必须大于 0".to_string());
         }
+        if self.keep_alive_max_requests == 0 {
+            return Err("keep_alive_max_requests 必须大于等于 1".to_string());
+        }
+        if self.gzip_bomb_ratio > 100 {
+            return Err("gzip_bomb_ratio 必须落在 0..=100 之间".to_string());
+        }
+        if self.gzip_bomb_ratio > 0 && !(1..=4096).contains(&self.gzip_bomb_mib) {
+            return Err("gzip_bomb_mib 必须落在 1..=4096 之间".to_string());
+        }
 
         if self.auth_token == DEFAULT_AUTH_TOKEN {
             warn!("auth_token 仍是默认值，请尽快改成只有自己知道的暗号");
@@ -152,6 +183,14 @@ min_garbage_bytes = 1500000
 max_garbage_bytes = 8000000
 chunk_size = 8192
 poison_deadline_secs = 600
+
+# gzip 炸弹：按百分比概率发送"小体积、大解压"的响应（0 = 关闭，100 = 每次都用）
+# 注意：会连带消耗中间代理/客户端的 CPU 与内存，请自行评估影响范围
+gzip_bomb_ratio = 0
+gzip_bomb_mib = 256
+
+# 单连接最多处理几个请求（1 = 不复用连接；>1 时同一连接会被反复投毒）
+keep_alive_max_requests = 1
 
 # 连接与超时保护
 max_connections = 512
