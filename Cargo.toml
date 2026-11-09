@@ -1,6 +1,6 @@
 [package]
 name = "mitm-test-server"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 description = "反中间人探测蜜罐服务端：无暗号流量灌入海量垃圾数据，友军探针正常放行"
 license = "AGPL-3.0-only"

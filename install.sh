@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
-#   sudo bash install.sh --version 0.9.1 --bind 0.0.0.0:8443
+#   sudo bash install.sh --version 0.9.2 --bind 0.0.0.0:8443
 #   sudo bash install.sh --auto-port            # 端口被占用时自动顺延
 #   sudo bash install.sh --uninstall            # 卸载（保留配置与数据）
 #   sudo bash install.sh --uninstall --purge    # 彻底删除
@@ -47,6 +47,8 @@ FORCE_CONFIG=0
 PURGE=0
 UNINSTALL=0
 DRY_RUN=0
+# 安装过程中是否停过正在运行的服务（用于失败时自动恢复）。
+SERVICE_STOPPED_BY_INSTALL=0
 
 # 端口被占用时是否自动顺延
 AUTO_PORT=0
@@ -67,7 +69,33 @@ fi
 
 log()  { printf '%s[+]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 warn() { printf '%s[!]%s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()  { printf '%s[-]%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; exit 1; }
+die()  {
+    printf '%s[-]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+    restore_service_if_needed
+    exit 1
+}
+
+# 安装中断时把之前停掉的服务重新拉起来，避免留下"服务已停"的状态。
+restore_service_if_needed() {
+    if [ "${SERVICE_STOPPED_BY_INSTALL:-0}" -ne 1 ]; then
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 0
+    warn "安装未完成，尝试重新启动之前停掉的 ${SERVICE_NAME}……"
+    systemctl start "$SERVICE_NAME" 2>/dev/null \
+        || warn "自动恢复失败，请手动执行: systemctl start ${SERVICE_NAME}"
+}
+
+# set -e 触发的兜底：同样尽量恢复服务，再按原退出码结束。
+on_error() {
+    local code=$?
+    if [ "${IN_ERROR_TRAP:-0}" -eq 1 ]; then
+        exit "$code"
+    fi
+    IN_ERROR_TRAP=1
+    restore_service_if_needed
+    exit "$code"
+}
 
 usage() {
     cat <<'EOF'
@@ -77,7 +105,7 @@ mitm-test-server 安装脚本
   sudo bash install.sh [选项]
 
 基本选项：
-  --version <ver>    安装指定版本（如 0.9.1 或 v0.9.1），默认 latest
+  --version <ver>    安装指定版本（如 0.9.2 或 v0.9.2），默认 latest
   --bind <addr>      监听地址，默认 0.0.0.0:8443
   --port <port>      只改端口，保留 --bind 的主机部分
   --auto-port        端口被占用时自动顺延到下一个空闲端口
@@ -203,7 +231,7 @@ detect_target() {
     esac
 }
 
-# 解析要安装的 release tag（形如 v0.9.1）。
+# 解析要安装的 release tag（形如 v0.9.2）。
 resolve_tag() {
     if [ "$VERSION" = "latest" ]; then
         log "查询最新版本……" >&2
@@ -237,7 +265,13 @@ write_file() {
         cat >/dev/null
         return 0
     fi
-    cat >"$path"
+    # 先写临时文件再原子替换：中途出错不会留下半截配置 / unit 文件。
+    local tmp="${path}.tmp.$$"
+    if ! cat >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$path"
 }
 
 run() {
@@ -344,6 +378,8 @@ stop_running_service() {
         return 0
     fi
     systemctl stop "$SERVICE_NAME" || warn "停止旧服务失败，端口检测可能不准"
+    # 记下来：后续任何一步失败都要把服务拉回来。
+    SERVICE_STOPPED_BY_INSTALL=1
 
     # 等端口真正释放（最多 3 秒）。
     local i=0
@@ -724,7 +760,7 @@ User=${SVC_USER}
 Group=${SVC_USER}
 WorkingDirectory=${CONFIG_DIR}
 ExecStart=${PREFIX}/bin/${BIN_NAME}
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=65535
@@ -858,6 +894,9 @@ EOF
 }
 
 main() {
+    # 安装中途失败时（set -e 触发）尽量把停掉的服务恢复。
+    trap on_error ERR
+
     parse_args "$@"
     require_root
 

@@ -10,6 +10,21 @@
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-09
+
+### 修复
+
+- **安装脚本中断（严重）**：生成 systemd 单元时 `ExecReload=/bin/kill -HUP $MAINPID`
+  里的 `$MAINPID` 被 shell 当成变量展开，`set -u` 下报
+  `MAINPID: unbound variable`，脚本在写完 unit 前中断。后果是 unit 文件被截断，
+  且流程已经先停掉了旧服务，导致更新后服务一直 `inactive (dead)`。
+  现在转义为 `\$MAINPID`，systemd 读到的是字面量。
+- unit 与配置文件改为「先写临时文件、再原子 `mv` 替换」：任何一步失败都不会留下
+  半截文件（原来 `cat > unit` 会先把原文件截断）。
+- 安装失败自动恢复：若本次安装停过服务，`die` 与 `set -e` 两条失败路径都会尝试
+  `systemctl start`，失败则打印手动恢复命令，不再把服务留在停止状态。
+- 受影响用户重跑一次安装脚本即可修复（配置、证书、暗号均保留）。
+
 ## [0.9.1] - 2026-11-09
 
 ### 变更
