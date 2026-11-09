@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main
 
 ```bash
 # 安装指定版本
-... | sudo bash -s -- --version 0.9.0
+... | sudo bash -s -- --version 0.9.1
 
 # 指定监听地址与暗号
 ... | sudo bash -s -- --bind 0.0.0.0:8443 --token "$(openssl rand -hex 32)"
@@ -80,7 +80,7 @@ journalctl -u mitm-test-server -f
 
 # 友军放行（应返回 authorized JSON）
 curl -k -H "X-Probe-Token: <安装脚本打印的暗号>" https://127.0.0.1:8443/
-# {"status":"authorized","probe":"mitm-test-server","version":"0.9.0"}
+# {"status":"authorized","probe":"mitm-test-server","version":"0.9.1"}
 ```
 
 ## 从源码构建

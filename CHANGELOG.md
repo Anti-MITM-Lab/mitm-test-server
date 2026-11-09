@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-09
+
+### 变更
+
+- 依赖升级（`cargo update`，无行为变化）：
+  - `rusqlite` 0.41.0 → 0.41.1
+  - `toml` 1.1.8 → 1.2.1（含 `toml_datetime` / `toml_writer` / `serde_spanned`）
+  - `aws-lc-rs` 1.18.2 → 1.19.0、`aws-lc-sys` 0.46 → 0.47（rustls 的加密后端）
+  - 传递依赖：`cc`、`log`、`mime`、`smallvec`、`syn`、`itoa`、`encoding_rs`、
+    `openssl-probe`、`utf8_iter`、`winnow`、`wasm-bindgen` 系列等
+- 配置结构、投毒行为、退出码均无变化，可直接覆盖升级。
+
 ## [0.9.0] - 2026-11-09
 
 ### 新增
