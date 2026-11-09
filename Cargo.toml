@@ -1,7 +1,10 @@
 [package]
 name = "mitm-test-server"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
+description = "反中间人探测蜜罐服务端：无暗号流量灌入海量垃圾数据，友军探针正常放行"
+license = "AGPL-3.0-only"
+readme = "README.md"
 
 [dependencies]
 chrono = "0.4.45"
@@ -14,3 +17,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = "0.26.6"
 toml = "1.1.8"
+
+# 发布构建：体积更小、投毒循环更快。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
