@@ -10,6 +10,19 @@
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-09
+
+### 修复
+
+- 修复 systemd 启动失败 `status=200/CHDIR`（`Changing to the requested working
+  directory failed: Permission denied`）：配置目录 `/etc/mitm-test` 原来被建成
+  `root:root 0750`，服务用户 `mitm-test` 既不是属主也不在属组，无法进入该目录。
+  现在目录创建时即设为 `root:mitm-test 0750`，数据目录设为 `mitm-test:mitm-test`，
+  并对已存在的目录显式校正权限与属组（升级安装即可修好旧实例）。
+- 服务启动失败不再只打印一行警告就宣称"安装完成"：现在会给出排查建议
+  （目录权限 / 端口占用 / 证书路径）并以非零状态退出，便于脚本与自动化发现失败。
+- 下载前提示可用 `--mirror` 加速，减少国内网络下等待时误以为卡死的情况。
+
 ## [0.8.2] - 2026-11-09
 
 ### 修复

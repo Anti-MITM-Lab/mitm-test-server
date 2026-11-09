@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
-#   sudo bash install.sh --version 0.8.2 --bind 0.0.0.0:8443
+#   sudo bash install.sh --version 0.8.3 --bind 0.0.0.0:8443
 #   sudo bash install.sh --auto-port            # 端口被占用时自动顺延
 #   sudo bash install.sh --uninstall            # 卸载（保留配置与数据）
 #   sudo bash install.sh --uninstall --purge    # 彻底删除
@@ -527,8 +527,19 @@ ensure_paths() {
     UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
     run install -d -m 0755 "$PREFIX/bin"
-    run install -d -m 0750 "$CONFIG_DIR"
-    run install -d -m 0750 "$DATA_DIR"
+
+    # 关键：配置目录必须让服务用户"可进入"（group 的 x 位）。
+    # 否则 systemd 启动时会报 status=200/CHDIR（Working directory 无权访问）。
+    run install -d -m 0750 -o root -g "$SVC_USER" "$CONFIG_DIR"
+    run install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
+
+    # 对已存在的目录再显式校正一次权限与属组（修复旧版本装坏的实例）。
+    if [ "$DRY_RUN" -eq 0 ]; then
+        chown "root:${SVC_USER}" "$CONFIG_DIR" 2>/dev/null || true
+        chmod 0750 "$CONFIG_DIR" 2>/dev/null || true
+        chown "${SVC_USER}:${SVC_USER}" "$DATA_DIR" 2>/dev/null || true
+        chmod 0750 "$DATA_DIR" 2>/dev/null || true
+    fi
 }
 
 ensure_user() {
@@ -557,6 +568,9 @@ install_binary() {
     trap "rm -rf '$tmpdir'" EXIT
 
     log "下载 ${asset}"
+    if [ -z "$MIRROR" ]; then
+        log "提示：若下载很慢，可 Ctrl-C 后重试并加 --mirror https://ghproxy.net/ 加速"
+    fi
     fetch "$url" "$tmpdir/$asset"
 
     if fetch "$url.sha256" "$tmpdir/$asset.sha256" 2>/dev/null; then
@@ -744,6 +758,12 @@ EOF
     else
         warn "服务未能启动，最近日志："
         journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+        warn "排查建议："
+        warn "  * 目录权限：ls -ld ${CONFIG_DIR} ${DATA_DIR}（服务用户 ${SVC_USER} 需能进入）"
+        warn "  * 端口占用：ss -lntp | grep ${BIND_PORT}"
+        warn "  * 证书路径：${CONFIG_DIR}/cert.pem、${CONFIG_DIR}/key.pem"
+        warn "修复后执行: systemctl restart ${SERVICE_NAME}"
+        return 1
     fi
 }
 
@@ -848,8 +868,8 @@ main() {
 
     log "目标平台 ${TARGET}，版本 ${TAG}"
 
-    ensure_paths
     ensure_user
+    ensure_paths
 
     # 端口：先看已有配置，再停旧服务，最后确认可用性。
     resolve_bind
