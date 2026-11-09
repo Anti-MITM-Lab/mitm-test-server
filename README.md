@@ -37,10 +37,17 @@ curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main
 
 ```bash
 # 安装指定版本
-... | sudo bash -s -- --version 0.8.0
+... | sudo bash -s -- --version 0.8.1
 
 # 指定监听地址与暗号
 ... | sudo bash -s -- --bind 0.0.0.0:8443 --token "$(openssl rand -hex 32)"
+
+# 只改端口；端口被占用时自动顺延到空闲端口
+... | sudo bash -s -- --port 9443 --auto-port
+
+# 显式指定 / 跳过防火墙配置
+... | sudo bash -s -- --firewall ufw
+... | sudo bash -s -- --no-firewall
 
 # 离线安装：使用本机已编译好的二进制
 sudo bash install.sh --binary ./target/x86_64-unknown-linux-musl/release/mitm-test-server
@@ -53,7 +60,17 @@ sudo bash install.sh --uninstall
 sudo bash install.sh --uninstall --purge
 ```
 
-升级只需重跑安装脚本：配置、证书与友军暗号都会保留，只有二进制被替换。
+升级只需重跑安装脚本：会先停掉旧服务释放端口，配置、证书与友军暗号都会保留，只有二进制被替换。
+
+### 端口与防火墙
+
+- **端口检测**：安装前用 `ss`（缺失时退化为 `netstat` 或 `/dev/tcp` 探测）检查端口是否被占用。
+  占用时打印占用进程并退出，提示改用 `--port` / `--bind`，或加 `--auto-port` 自动向上找空闲端口。
+  已有配置存在时以其 `bind_addr` 为准（要改写需加 `--force-config`）。
+- **自动放行**：识别 ufw、firewalld、iptables、nftables 并放行监听端口；已有规则不会重复添加。
+  只对**处于启用状态**的防火墙动手，脚本不会自行启用防火墙，也不会改动无法识别的防火墙。
+- iptables / nftables 的规则默认不持久化（重启后失效），脚本会给出提示；生产环境建议用 ufw 或 firewalld。
+- 云服务器还需要在安全组里单独放行该 TCP 端口，脚本无法代劳。
 
 安装完成后：
 
@@ -63,7 +80,7 @@ journalctl -u mitm-test-server -f
 
 # 友军放行（应返回 authorized JSON）
 curl -k -H "X-Probe-Token: <安装脚本打印的暗号>" https://127.0.0.1:8443/
-# {"status":"authorized","probe":"mitm-test-server","version":"0.8.0"}
+# {"status":"authorized","probe":"mitm-test-server","version":"0.8.1"}
 ```
 
 ## 从源码构建
