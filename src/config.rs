@@ -46,6 +46,10 @@ pub struct AppConfig {
     pub poison_deadline_secs: u64,
     /// 并发连接上限，超出后直接丢弃新连接以保护文件描述符。
     pub max_connections: usize,
+    /// 单个来源 IP 的并发连接上限，`0` 表示不限制。
+    ///
+    /// 防止一个扫描器占用全部连接槽位并吃满出口带宽。
+    pub max_conn_per_ip: usize,
     /// 同一来源 IP 的 AbuseIPDB 举报冷却时间（秒）。
     pub report_cooldown_secs: u64,
     /// AbuseIPDB API Key；留空则关闭自动举报。
@@ -67,6 +71,7 @@ impl Default for AppConfig {
             handshake_timeout_secs: 10,
             poison_deadline_secs: 600,
             max_connections: 512,
+            max_conn_per_ip: 32,
             report_cooldown_secs: 3600,
             abuseipdb_api_key: None,
         }
@@ -150,6 +155,7 @@ poison_deadline_secs = 600
 
 # 连接与超时保护
 max_connections = 512
+max_conn_per_ip = 32
 header_timeout_secs = 8
 handshake_timeout_secs = 10
 

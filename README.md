@@ -112,6 +112,7 @@ cargo build --release --target aarch64-unknown-linux-musl
 | `poison_deadline_secs` | `600` | 单连接投毒时限，`0` 为不限 |
 | `handshake_timeout_secs` / `header_timeout_secs` | 10 / 8 | 握手与读头超时，防 Slowloris |
 | `max_connections` | `512` | 并发上限，超出直接丢弃 |
+| `max_conn_per_ip` | `32` | 单 IP 并发上限，`0` 为不限制 |
 | `abuseipdb_api_key` | 空 | 留空则关闭自动举报 |
 | `report_cooldown_secs` | `3600` | 同一 IP 举报冷却时间 |
 

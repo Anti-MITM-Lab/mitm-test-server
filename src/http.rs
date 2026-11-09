@@ -189,6 +189,44 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// 判断查询参数是否可能承载凭据（比较时忽略大小写）。
+fn is_sensitive_param(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "token"
+            | "access_token"
+            | "auth"
+            | "authorization"
+            | "apikey"
+            | "api_key"
+            | "key"
+            | "sig"
+            | "signature"
+            | "password"
+            | "passwd"
+            | "pwd"
+    )
+}
+
+/// 落库 / 打日志前对请求目标脱敏：保留路径，把敏感查询参数的值替换成 `***`。
+///
+/// 友军探针可以用 `?token=<暗号>` 鉴权，如果原样记录，暗号就会出现在 SQLite
+/// 和 journald 里，甚至被带进 AbuseIPDB 的举报备注——那等于自己泄露口令。
+pub fn redact_target(target: &str) -> String {
+    let Some((path, query)) = target.split_once('?') else {
+        return target.to_string();
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if is_sensitive_param(name) => format!("{name}=***"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{masked}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +257,18 @@ mod tests {
         assert!(constant_time_eq(b"token", b"token"));
         assert!(!constant_time_eq(b"token", b"toke"));
         assert!(!constant_time_eq(b"token", b"tokem"));
+    }
+
+    /// 落库/日志用的目标必须把暗号抹掉，但不影响其他参数与路径。
+    #[test]
+    fn redacts_sensitive_query_values() {
+        assert_eq!(redact_target("/?token=abc123"), "/?token=***");
+        assert_eq!(
+            redact_target("/admin?next=%2F&Token=abc&x=1"),
+            "/admin?next=%2F&Token=***&x=1"
+        );
+        assert_eq!(redact_target("/index.html"), "/index.html");
+        assert_eq!(redact_target("/?a=1&b=2"), "/?a=1&b=2");
+        assert_eq!(redact_target("/?flag"), "/?flag");
     }
 }

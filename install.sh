@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
-#   sudo bash install.sh --version 0.8.3 --bind 0.0.0.0:8443
+#   sudo bash install.sh --version 0.8.4 --bind 0.0.0.0:8443
 #   sudo bash install.sh --auto-port            # 端口被占用时自动顺延
 #   sudo bash install.sh --uninstall            # 卸载（保留配置与数据）
 #   sudo bash install.sh --uninstall --purge    # 彻底删除
@@ -637,6 +637,7 @@ poison_deadline_secs = 600
 
 # 连接与超时保护
 max_connections = 512
+max_conn_per_ip = 32
 header_timeout_secs = 8
 handshake_timeout_secs = 10
 
@@ -706,6 +707,9 @@ Description=mitm-test-server anti-MITM honeypot
 Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
+# 配置错误时最多重试 5 次/分钟，避免无限重启刷 journal
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -734,6 +738,8 @@ WantedBy=multi-user.target
 EOF
 
     run systemctl daemon-reload
+    # 清掉上一次失败计数，否则重启次数超限时 systemctl 会拒绝启动。
+    run systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
     if ! run systemctl enable --now "$SERVICE_NAME" 2>/dev/null; then
         warn "systemctl enable/start 失败（容器环境常见），可手动运行: cd ${CONFIG_DIR} && ${PREFIX}/bin/${BIN_NAME}"
         return 0

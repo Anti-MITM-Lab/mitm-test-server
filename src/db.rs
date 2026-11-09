@@ -9,10 +9,15 @@
 //! * 崩溃只会丢掉最后排队的一小批事件，对情报采集影响可忽略。
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use tokio::sync::mpsc;
+
+/// 事件队列容量。队列有界，避免磁盘写不动时把事件堆在内存里拖垮进程。
+const QUEUE_CAPACITY: usize = 4096;
 
 /// 事件写入语句；各列与 [`ProbeEvent`] 字段一一对应。
 const INSERT_SQL: &str = "INSERT INTO probe_logs
@@ -43,7 +48,9 @@ pub struct ProbeEvent {
 /// 数据库句柄。克隆成本极低，可自由跨任务传递。
 #[derive(Clone)]
 pub struct Database {
-    sender: mpsc::UnboundedSender<ProbeEvent>,
+    sender: mpsc::Sender<ProbeEvent>,
+    /// 因队列已满而丢弃的事件计数（用于限频率告警）。
+    dropped: Arc<AtomicU64>,
 }
 
 impl Database {
@@ -61,7 +68,7 @@ impl Database {
         )?;
         init_schema(&connection)?;
 
-        let (sender, mut receiver) = mpsc::unbounded_channel::<ProbeEvent>();
+        let (sender, mut receiver) = mpsc::channel::<ProbeEvent>(QUEUE_CAPACITY);
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
                 let probe_time = chrono::Utc::now().to_rfc3339();
@@ -86,12 +93,23 @@ impl Database {
             }
         });
 
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            dropped: Arc::new(AtomicU64::new(0)),
+        })
     }
 
-    /// 非阻塞记录。写入失败（例如接收端已退出）时静默忽略。
+    /// 非阻塞记录。队列满或写入端已退出时丢弃事件并计数，绝不阻塞投毒。
     pub fn record(&self, event: ProbeEvent) {
-        let _ = self.sender.send(event);
+        if self.sender.try_send(event).is_err() {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // 每丢 1000 条提示一次，避免日志本身成为新的风暴源。
+            if dropped % 1000 == 1 {
+                warn!(
+                    "情报队列已满，累计丢弃 {dropped} 条事件（数据库写入跟不上，检查磁盘与 db_path）"
+                );
+            }
+        }
     }
 }
 

@@ -3,9 +3,10 @@
 //! 鉴权与投毒之间没有共享状态，每条连接完全独立；并发上限由 `Semaphore`
 //! 控制，防止被海量连接耗尽文件描述符。
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -19,12 +20,82 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::AppConfig;
 use crate::db::{Database, ProbeEvent};
-use crate::http::{self, MAX_HEAD_BYTES, RequestHead};
+use crate::http::{self, HeadError, MAX_HEAD_BYTES, RequestHead};
 use crate::payload::{self, Plan};
 use crate::report::Reporter;
 
 /// 单次写入的超时：对方若长时间不读，说明连接已死或在做流控，直接放弃。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 单 IP 并发连接计数器。
+///
+/// 全局 `Semaphore` 只能防止总量失控；单个 IP 仍可以占满全部槽位、吃光出口带宽。
+/// 这里按来源 IP 再限一层，超出直接丢弃连接（连 TLS 握手都不做）。
+struct IpLimiter {
+    limit: usize,
+    active: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl IpLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 申请一个名额；超过上限返回 `None`。
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpGuard> {
+        let mut active = match self.active.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if self.limit > 0 {
+            let count = active.entry(ip).or_insert(0);
+            if *count >= self.limit {
+                return None;
+            }
+            *count += 1;
+        }
+
+        Some(IpGuard {
+            limiter: Arc::clone(self),
+            ip,
+            counted: self.limit > 0,
+        })
+    }
+}
+
+/// 连接结束时自动归还名额。
+struct IpGuard {
+    limiter: Arc<IpLimiter>,
+    ip: IpAddr,
+    counted: bool,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut active = match self.limiter.active.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let should_remove = match active.get_mut(&self.ip) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        if should_remove {
+            active.remove(&self.ip);
+        }
+    }
+}
 
 /// 启动服务，直到收到 Ctrl-C / SIGTERM。
 pub async fn run(
@@ -38,6 +109,7 @@ pub async fn run(
     print_banner(&config, local_address, &reporter);
 
     let permits = Arc::new(Semaphore::new(config.max_connections));
+    let per_ip = Arc::new(IpLimiter::new(config.max_conn_per_ip));
     let active = Arc::new(AtomicU64::new(0));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -55,6 +127,18 @@ pub async fn run(
                         // 单次 accept 失败（如瞬时文件描述符不足）不应拖垮整个服务。
                         warn!("accept 失败: {e}");
                         tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+
+                // 先看单 IP 配额，再看全局配额：单 IP 超限时连握手都不做。
+                let ip_guard = match per_ip.try_acquire(peer.ip()) {
+                    Some(guard) => guard,
+                    None => {
+                        warn!(
+                            "单 IP 并发连接已达上限 {}，丢弃来自 {peer} 的连接",
+                            config.max_conn_per_ip
+                        );
                         continue;
                     }
                 };
@@ -78,6 +162,7 @@ pub async fn run(
                     active.fetch_add(1, Ordering::Relaxed);
                     handle_connection(stream, peer, &acceptor, &config, &db, &reporter).await;
                     active.fetch_sub(1, Ordering::Relaxed);
+                    drop(ip_guard);
                     drop(permit);
                 });
             }
@@ -125,6 +210,8 @@ async fn handle_connection(
         }
     };
 
+    // 解析失败同样投毒：不少扫描器会先发一段非 HTTP 数据探活，或者干脆
+    // 发超长/畸形请求头；以前直接关连接等于白送它一次探测机会。
     let head = match http::read_head(
         &mut tls,
         Duration::from_secs(config.header_timeout_secs),
@@ -132,22 +219,40 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(head) => head,
-        Err(e) => {
-            debug!("{peer} 未取得有效请求头: {e}");
+        Ok(head) => Some(head),
+        Err(e @ HeadError::Eof) => {
+            debug!("{peer} 未发送请求就断开: {e}");
             return;
+        }
+        Err(e) => {
+            debug!("{peer} 请求头无效（{e}），转为直接投毒");
+            None
         }
     };
 
-    if head.is_http2_preface() {
+    if let Some(head) = &head
+        && head.is_http2_preface()
+    {
         debug!("{peer} 直接发送了 HTTP/2 前言（未走 ALPN），按未授权处理");
     }
 
-    let user_agent = head.user_agent().map(str::to_string);
-    let target = Some(head.target.clone());
+    let user_agent = head
+        .as_ref()
+        .and_then(|head| head.user_agent())
+        .map(str::to_string);
     let ua_display = user_agent.clone().unwrap_or_else(|| "-".to_string());
+    // 落库/上报/日志统一用脱敏后的目标，避免把 `?token=` 里的暗号写进磁盘或第三方。
+    let target = head.as_ref().map(|head| http::redact_target(&head.target));
+    let target_display = target.clone().unwrap_or_else(|| "-".to_string());
+    let method = head
+        .as_ref()
+        .map(|head| head.method.as_str())
+        .unwrap_or("-");
 
-    if is_authorized(&head, &config.auth_token) {
+    if head
+        .as_ref()
+        .is_some_and(|head| is_authorized(head, &config.auth_token))
+    {
         success!("验证通过：{peer} 是友军探针（UA: {ua_display}）");
         let response = authorized_response();
         let _ = tls.write_all(response.as_bytes()).await;
@@ -165,15 +270,16 @@ async fn handle_connection(
         return;
     }
 
-    warn!(
-        "捕获未授权探测节点 {peer}（{} {}，UA: {ua_display}），开始投毒",
-        head.method, head.target
-    );
+    if head.is_none() {
+        warn!("捕获未完成 HTTP 请求的探测节点 {peer}（UA: {ua_display}），直接投毒");
+    } else {
+        warn!("捕获未授权探测节点 {peer}（{method} {target_display}，UA: {ua_display}），开始投毒");
+    }
 
     if reporter.enabled() {
         reporter.report_later(
             peer.ip(),
-            format!("{peer} {} {} UA={ua_display}", head.method, head.target),
+            format!("{peer} {method} {target_display} UA={ua_display}"),
         );
     }
 
@@ -360,12 +466,17 @@ fn print_banner(config: &AppConfig, local: SocketAddr, reporter: &Reporter) {
     );
     info!("友军暗号：X-Probe-Token / Authorization: Bearer / ?token=");
     info!(
-        "投毒规模：{} ~ {}，分块基准 {}，单连接时限 {} 秒，并发上限 {}",
+        "投毒规模：{} ~ {}，分块基准 {}，单连接时限 {} 秒，并发上限 {}（单 IP {}）",
         human_bytes(config.min_garbage_bytes as u64),
         human_bytes(config.max_garbage_bytes as u64),
         human_bytes(config.chunk_size as u64),
         config.poison_deadline_secs,
-        config.max_connections
+        config.max_connections,
+        if config.max_conn_per_ip == 0 {
+            "不限".to_string()
+        } else {
+            config.max_conn_per_ip.to_string()
+        }
     );
     if reporter.enabled() {
         info!(
@@ -406,4 +517,51 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单 IP 配额：到上限后拒绝，连接结束后名额归还、表项清理。
+    #[test]
+    fn per_ip_limit_is_enforced_and_released() {
+        let limiter = Arc::new(IpLimiter::new(2));
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        let first = limiter.try_acquire(ip).expect("第一个名额");
+        let second = limiter.try_acquire(ip).expect("第二个名额");
+        assert!(limiter.try_acquire(ip).is_none(), "超过上限应被拒绝");
+        assert_eq!(limiter.active.lock().unwrap().get(&ip), Some(&2));
+
+        drop(first);
+        assert_eq!(limiter.active.lock().unwrap().get(&ip), Some(&1));
+
+        drop(second);
+        assert!(
+            limiter.active.lock().unwrap().is_empty(),
+            "归零后应清理表项"
+        );
+    }
+
+    /// 0 表示不限制。
+    #[test]
+    fn zero_means_unlimited() {
+        let limiter = Arc::new(IpLimiter::new(0));
+        let ip: IpAddr = "198.51.100.9".parse().unwrap();
+        let guards: Vec<_> = (0..100).filter_map(|_| limiter.try_acquire(ip)).collect();
+        assert_eq!(guards.len(), 100);
+    }
+
+    /// 不同 IP 之间互不影响。
+    #[test]
+    fn limits_are_per_ip() {
+        let limiter = Arc::new(IpLimiter::new(1));
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+
+        let _guard_a = limiter.try_acquire(a).expect("a 的首个名额");
+        assert!(limiter.try_acquire(a).is_none());
+        assert!(limiter.try_acquire(b).is_some(), "b 不应受 a 影响");
+    }
 }
