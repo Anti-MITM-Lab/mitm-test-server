@@ -8,28 +8,75 @@
 
 > 仅用于自查链路、研究蜜罐与对抗扫描。请只部署在你拥有或获得授权的网络与主机上。
 
-## 快速开始
+## 安装（Linux）
+
+一条命令安装（需要 root，脚本会创建系统用户、生成配置与自签证书、注册 systemd 服务）：
 
 ```bash
-# 1. 自签一张证书（或换成你自己的正式证书）
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout key.pem -out cert.pem -subj "/CN=mitm-test.local"
-
-# 2. 编译并运行（首次运行会自动生成 server-config.toml）
-cargo run --release
-
-# 3. 验证友军放行
-curl -k -H "X-Probe-Token: <你的暗号>" https://127.0.0.1:8443/
-# {"status":"authorized","probe":"mitm-test-server","version":"0.8.0"}
-
-# 4. 观察投毒（会收到一大堆无意义的 HTML/二进制数据）
-curl -k https://127.0.0.1:8443/
+curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
 ```
 
-交叉编译静态二进制（部署到 Linux VPS）：
+国内网络可加 GitHub 加速前缀：
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh \
+  | sudo bash -s -- --mirror https://ghfast.top/
+```
+
+安装脚本做的事：
+
+| 项目 | 默认位置 |
+|------|----------|
+| 二进制 | `/usr/local/bin/mitm-test-server` |
+| 配置（含随机友军暗号） | `/etc/mitm-test/server-config.toml` |
+| 证书 / 私钥 | `/etc/mitm-test/cert.pem`、`key.pem` |
+| 情报库 | `/var/lib/mitm-test/mitm_intel.db` |
+| systemd 单元 | `mitm-test-server.service` |
+
+常用参数（完整列表见 `install.sh --help`）：
+
+```bash
+# 安装指定版本
+... | sudo bash -s -- --version 0.8.0
+
+# 指定监听地址与暗号
+... | sudo bash -s -- --bind 0.0.0.0:8443 --token "$(openssl rand -hex 32)"
+
+# 离线安装：使用本机已编译好的二进制
+sudo bash install.sh --binary ./target/x86_64-unknown-linux-musl/release/mitm-test-server
+
+# 已有正式证书，跳过自签
+... | sudo bash -s -- --no-cert
+
+# 卸载（保留配置与数据）/ 彻底删除
+sudo bash install.sh --uninstall
+sudo bash install.sh --uninstall --purge
+```
+
+升级只需重跑安装脚本：配置、证书与友军暗号都会保留，只有二进制被替换。
+
+安装完成后：
+
+```bash
+systemctl status mitm-test-server
+journalctl -u mitm-test-server -f
+
+# 友军放行（应返回 authorized JSON）
+curl -k -H "X-Probe-Token: <安装脚本打印的暗号>" https://127.0.0.1:8443/
+# {"status":"authorized","probe":"mitm-test-server","version":"0.8.0"}
+```
+
+## 从源码构建
+
+```bash
+# 本机运行（首次运行会在工作目录生成 server-config.toml）
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj "/CN=mitm-test.local"
+cargo run --release
+
+# 静态二进制（部署到任意 Linux，无需 glibc）
 cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 ## 配置
@@ -119,18 +166,30 @@ src/
 ├── db.rs       SQLite 情报库（单写线程）
 ├── report.rs   AbuseIPDB 自动举报（按 IP 冷却）
 └── logging.rs  日志宏
+.github/workflows/
+├── ci.yml      格式 / Clippy / 测试
+└── release.yml 构建 musl 二进制、打 tag、发布 Release
 ```
 
 调试时设置 `MITM_TEST_VERBOSE=1` 可看到握手失败、空请求等噪声日志。
 
+## 发布流程
+
+版本号以 `Cargo.toml` 的 `version` 为唯一来源，Release 由 GitHub Actions 自动完成：
+
+1. 改 `Cargo.toml` 的 `version`；
+2. **在 [CHANGELOG.md](CHANGELOG.md) 新增同名 `## [x.y.z]` 段落**，写清新增 / 修复 /
+   行为变化（缺这段，发版会直接失败）；
+3. 提交并推送到 `main`。
+
+随后 `Release` 工作流会：解析版本号 → 若 `vx.y.z` 标签不存在则构建
+`x86_64` / `aarch64` 的 musl 静态二进制（带 Cargo 与目标目录缓存）→ 打包并生成
+SHA-256 → 创建并推送 `vx.y.z` 标签 → 把 CHANGELOG 段落作为 Release 说明发布。
+
+也就是说：**每次服务端更新，都必须把更新内容写进 CHANGELOG，最终会原样出现在
+Release 页面**。同一版本重复推送不会重复发版。
+
 ## 变更记录
 
-### 0.8.0
-
-- 拆分单文件为 8 个模块，补齐文档注释，`cargo fmt` / `cargo clippy` 干净。
-- 投毒升级：五种响应形态、随机指纹、随机资源引用、分块抖动与长停顿。
-- 修复：ALPN 曾声明 `h2` 却只实现了 HTTP/1.1，导致 h2 客户端卡死；现只声明 `http/1.1`。
-- 修复：暗号匹配改为大小写不敏感 + 常量时间比较，并支持 `Bearer` 与 `?token=`。
-- 新增：握手/读头/写入超时、并发上限、优雅退出、配置校验。
-- 新增：情报库记录 UA、请求路径、诱饵类型与实际发送字节数，并自动迁移旧库。
-- 新增：AbuseIPDB 按 IP 冷却去重，避免重复举报浪费配额。
+见 [CHANGELOG.md](CHANGELOG.md)，历史版本见
+[Releases](https://github.com/Anti-MITM-Lab/mitm-test-server/releases)。

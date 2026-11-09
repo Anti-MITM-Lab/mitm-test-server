@@ -1,0 +1,240 @@
+name: Release
+
+# 每次推送到 main：读取 Cargo.toml 的版本号，若对应 tag 还不存在，
+# 就构建 Linux（musl 静态）二进制、打 tag、发布 Release。
+# 发布说明取自 CHANGELOG.md 中该版本的段落 —— 没有写更新内容就不允许发版。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: mitm-test-server
+
+jobs:
+  prepare:
+    name: 解析版本 / 判断是否需要发版
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - name: 检出代码（含标签）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取版本并校验 CHANGELOG
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          [ -n "$version" ] || { echo "::error::无法从 Cargo.toml 解析 version"; exit 1; }
+          tag="v${version}"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::notice::标签 ${tag} 已存在，本次不重复发版"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 发版红线：CHANGELOG 必须有该版本段落，否则禁止发布
+          if ! grep -qF "## [${version}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 缺少 [${version}] 段落；每次发版必须写明更新内容"
+            exit 1
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "准备发布 ${tag}"
+
+  test:
+    name: 发布前测试
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 与构建产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  build:
+    name: 构建 ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 与目标平台
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装交叉编译工具链
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: 缓存 Cargo 与构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: . -> target
+
+      - name: 编译（release）
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 打包与校验
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          asset="${BIN_NAME}-v${version}-${target}.tar.gz"
+          stage="dist/stage-${target}"
+
+          mkdir -p "$stage"
+          cp "target/${target}/release/${BIN_NAME}" "$stage/"
+          cp README.md CHANGELOG.md LICENSE install.sh "$stage/"
+          tar -czf "dist/${asset}" -C "$stage" .
+          ( cd dist && sha256sum "${asset}" > "${asset}.sha256" )
+
+          ls -lh "dist/${asset}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 打 tag 并发布 Release
+    needs: [prepare, test, build]
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码（含标签）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成发布说明
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## 更新内容"
+            echo
+            awk -v ver="[${VERSION}]" '
+              index($0, "## " ver) == 1 { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md
+            echo
+            echo "## 安装 / 升级"
+            echo
+            echo '一条命令安装（自带 systemd 服务、自签证书与随机暗号）：'
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo bash"
+            echo '```'
+            echo
+            echo "指定本次版本："
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo bash -s -- --version ${VERSION}"
+            echo '```'
+            echo
+            echo "升级同样只需重跑脚本，配置与暗号会保留。"
+            echo
+            echo "## 下载"
+            echo
+            for f in dist/*.tar.gz; do
+              echo "- \`$(basename "$f")\` — \`$(cut -d' ' -f1 "${f}.sha256")\`"
+            done
+            echo
+            echo "完整更新日志：[CHANGELOG.md](https://github.com/${REPO}/blob/main/CHANGELOG.md)"
+          } > notes.md
+
+          echo "----- 发布说明预览 -----"
+          cat notes.md
+
+      - name: 创建并推送 tag
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body_path: notes.md
+          files: dist/*
+          make_latest: true
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
