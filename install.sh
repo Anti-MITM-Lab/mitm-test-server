@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/Anti-MITM-Lab/mitm-test-server/main/install.sh | sudo bash
-#   sudo bash install.sh --version 0.8.1 --bind 0.0.0.0:8443
+#   sudo bash install.sh --version 0.8.2 --bind 0.0.0.0:8443
 #   sudo bash install.sh --auto-port            # 端口被占用时自动顺延
 #   sudo bash install.sh --uninstall            # 卸载（保留配置与数据）
 #   sudo bash install.sh --uninstall --purge    # 彻底删除
@@ -210,7 +210,7 @@ resolve_tag() {
         local json tag
         json="$(fetch_stdout "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null)" \
             || die "查询最新版本失败；请用 --version 指定版本，或用 --mirror 指定加速地址"
-        tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+        tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
         [ -n "$tag" ] || die "无法从 GitHub API 解析最新版本号，请用 --version 指定"
         TAG="$tag"
     else
@@ -263,21 +263,23 @@ split_bind() {
 
 # 端口是否已有监听。
 port_in_use() {
-    local port="$1"
+    local port="$1" output=""
 
     if command -v ss >/dev/null 2>&1; then
-        ss -H -l -n -t "sport = :${port}" 2>/dev/null | grep -q . && return 0
+        # 先取输出再判断，避免 `| grep -q` 在 pipefail 下被 SIGPIPE 误伤。
+        output="$(ss -H -l -n -t "sport = :${port}" 2>/dev/null || true)"
+        [ -n "$output" ] && return 0
         return 1
     fi
 
     if command -v netstat >/dev/null 2>&1; then
-        netstat -lnt 2>/dev/null | awk 'NR > 2 { print $4 }' | grep -qE "[:.]${port}$" && return 0
+        output="$(netstat -lnt 2>/dev/null || true)"
+        grep -qE "[:.]${port}[[:space:]]" <<< "$output" && return 0
         return 1
     fi
 
     # 兜底：用 bash 的 /dev/tcp 试着连一下本机端口。
     if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-        exec 3>&- 2>/dev/null || true
         return 0
     fi
 
@@ -289,10 +291,10 @@ port_in_use() {
 port_owner() {
     local port="$1" line=""
     if command -v ss >/dev/null 2>&1; then
-        line="$(ss -H -l -n -t -p "sport = :${port}" 2>/dev/null | head -n 1)"
+        line="$(ss -H -l -n -t -p "sport = :${port}" 2>/dev/null | head -n 1 || true)"
     fi
     if [ -z "$line" ] && command -v lsof >/dev/null 2>&1; then
-        line="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { print $1" (pid "$2")" }')"
+        line="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { print $1" (pid "$2")" }' || true)"
     fi
     printf '%s\n' "${line:-未知进程}"
 }
@@ -318,7 +320,7 @@ resolve_bind() {
     local cfg="$CONFIG_DIR/server-config.toml"
     if [ -f "$cfg" ] && [ "$FORCE_CONFIG" -ne 1 ]; then
         local saved
-        saved="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1)"
+        saved="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1 || true)"
         if [ -n "$saved" ]; then
             if [ "$saved" != "$BIND_ADDR" ]; then
                 warn "已有配置监听 ${saved}，本次保留；如需改为 ${BIND_ADDR} 请加 --force-config"
@@ -389,13 +391,24 @@ detect_firewall() {
         return 0
     fi
 
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n 1 | grep -qi "Status: active"; then
+    local ufw_state="" iptables_rules=""
+
+    # 先一次性取回输出再匹配：避免 `cmd | head | grep -q` 在 pipefail 下
+    # 因上游被 SIGPIPE 杀掉而误判（真实 ufw status 会输出多行）。
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_state="$(ufw status 2>/dev/null || true)"
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        iptables_rules="$(iptables -S INPUT 2>/dev/null || true)"
+    fi
+
+    if [ -n "$ufw_state" ] && grep -qi "Status: active" <<< "$ufw_state"; then
         FIREWALL_BACKEND="ufw"
     elif command -v firewall-cmd >/dev/null 2>&1 && [ "$(firewall-cmd --state 2>/dev/null || true)" = "running" ]; then
         FIREWALL_BACKEND="firewalld"
     elif command -v nft >/dev/null 2>&1 && nft list chain inet filter input >/dev/null 2>&1; then
         FIREWALL_BACKEND="nft"
-    elif command -v iptables >/dev/null 2>&1 && iptables -S INPUT 2>/dev/null | grep -vq '^-P INPUT ACCEPT$'; then
+    elif [ -n "$iptables_rules" ] && grep -qE '^(-A INPUT |-P INPUT (DROP|REJECT))' <<< "$iptables_rules"; then
         FIREWALL_BACKEND="iptables"
     else
         FIREWALL_BACKEND="none"
@@ -411,7 +424,9 @@ open_firewall_port() {
             log "未检测到启用中的防火墙，跳过放行；若使用云厂商安全组，请手动放行 ${BIND_PORT}/tcp"
             ;;
         ufw)
-            if ufw status 2>/dev/null | grep -qE "^${BIND_PORT}/tcp[[:space:]]+ALLOW"; then
+            local ufw_rules
+            ufw_rules="$(ufw status 2>/dev/null || true)"
+            if grep -qE "^${BIND_PORT}/tcp[[:space:]]+ALLOW" <<< "$ufw_rules"; then
                 FIREWALL_RESULT="ufw 已放行 ${BIND_PORT}/tcp（规则已存在）"
                 log "ufw 中已有 ${BIND_PORT}/tcp 放行规则"
             else
@@ -451,7 +466,9 @@ open_firewall_port() {
             fi
             ;;
         nft)
-            if nft list chain inet filter input 2>/dev/null | grep -q "tcp dport ${BIND_PORT} accept"; then
+            local nft_rules
+            nft_rules="$(nft list chain inet filter input 2>/dev/null || true)"
+            if grep -q "tcp dport ${BIND_PORT} accept" <<< "$nft_rules"; then
                 FIREWALL_RESULT="nftables 已放行 ${BIND_PORT}/tcp（规则已存在）"
                 log "nftables 中已有 ${BIND_PORT}/tcp 放行规则"
             else
@@ -472,7 +489,9 @@ close_firewall_port() {
     case "$FIREWALL_BACKEND" in
         none) return 0 ;;
         ufw)
-            if ufw status 2>/dev/null | grep -qE "^${port}/tcp[[:space:]]+ALLOW"; then
+            local ufw_rules
+            ufw_rules="$(ufw status 2>/dev/null || true)"
+            if grep -qE "^${port}/tcp[[:space:]]+ALLOW" <<< "$ufw_rules"; then
                 log "ufw 移除 ${port}/tcp 放行规则"
                 run ufw delete allow "${port}/tcp" >/dev/null 2>&1 \
                     || warn "ufw 规则移除失败，请手动执行: ufw delete allow ${port}/tcp"
@@ -567,7 +586,7 @@ resolve_token() {
         return 0
     fi
     if [ -f "$cfg" ]; then
-        TOKEN="$(sed -n 's/^[[:space:]]*auth_token[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1)"
+        TOKEN="$(sed -n 's/^[[:space:]]*auth_token[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1 || true)"
     fi
     if [ -z "${TOKEN}" ]; then
         TOKEN="$(gen_token)"
@@ -714,7 +733,9 @@ EOF
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         log "服务已启动"
         if command -v ss >/dev/null 2>&1; then
-            if ss -H -l -n -t "sport = :${BIND_PORT}" 2>/dev/null | grep -q .; then
+            local listening
+            listening="$(ss -H -l -n -t "sport = :${BIND_PORT}" 2>/dev/null || true)"
+            if [ -n "$listening" ]; then
                 log "确认 ${BIND_ADDR} 已在监听"
             else
                 warn "服务在运行，但未检测到 ${BIND_PORT} 端口监听，请检查 journalctl -u ${SERVICE_NAME}"
@@ -729,7 +750,7 @@ EOF
 # 卸载时从（可能已被删除的）配置里读端口，用于移除防火墙规则。
 config_port() {
     local cfg="$CONFIG_DIR/server-config.toml" bind port
-    bind="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n 1)"
+    bind="$(sed -n 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" 2>/dev/null | head -n 1 || true)"
     if [ -z "$bind" ]; then
         printf '%s' "8443"
         return 0
